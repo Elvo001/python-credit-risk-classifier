@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, Tuple
+
+import numpy as np
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    roc_auc_score,
+    roc_curve,
+)
+from sklearn.model_selection import train_test_split
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+RANDOM_STATE = 42
+
+
+# --------------------------------------------------
+# 1. Synthetic credit-risk style dataset
+# --------------------------------------------------
+def load_credit_risk_data(
+    n_samples: int = 12000,
+    random_state: int = RANDOM_STATE,
+) -> Tuple[pd.DataFrame, pd.Series]:
+    """
+    Create a synthetic binary classification dataset that mimics a
+    credit-risk / probability-of-default use case.
+
+    Target:
+        1 = default / bad outcome
+        0 = non-default / good outcome
+    """
+    X, y = make_classification(
+        n_samples=n_samples,
+        n_features=15,
+        n_informative=8,
+        n_redundant=4,
+        n_repeated=0,
+        n_classes=2,
+        weights=[0.78, 0.22],   # imbalanced classes are common in risk
+        class_sep=1.1,
+        flip_y=0.01,
+        random_state=random_state,
+    )
+
+    feature_names = [
+        "income_stability",
+        "debt_to_income",
+        "utilization_rate",
+        "credit_history_length",
+        "recent_delinquency_score",
+        "loan_to_income",
+        "savings_ratio",
+        "employment_stability",
+        "repayment_variability",
+        "recent_inquiries",
+        "cashflow_volatility",
+        "monthly_obligation_ratio",
+        "exposure_level",
+        "behavioral_risk_index",
+        "customer_tenure_score",
+    ]
+
+    X_df = pd.DataFrame(X, columns=feature_names)
+    y_series = pd.Series(y, name="default_flag")
+
+    return X_df, y_series
+
+
+# --------------------------------------------------
+# 2. Metrics
+# --------------------------------------------------
+def gini_from_auc(auc: float) -> float:
+    """Banking-style Gini from ROC-AUC."""
+    return 2 * auc - 1
+
+
+def ks_statistic(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """
+    Compute Kolmogorov-Smirnov statistic from ROC curve components.
+    KS = max(TPR - FPR)
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    return float(np.max(tpr - fpr))
+
+
+@dataclass
+class EvaluationResult:
+    threshold: float
+    accuracy: float
+    roc_auc: float
+    gini: float
+    ks: float
+    confusion_matrix: np.ndarray
+    classification_report: str
+
+
+# --------------------------------------------------
+# 3. Train + evaluate
+# --------------------------------------------------
+def build_model() -> Pipeline:
+    """
+    Logistic regression is a strong governance-friendly baseline
+    for credit risk modeling.
+    """
+    return Pipeline(
+        steps=[
+            ("scaler", StandardScaler()),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=1000,
+                    solver="lbfgs",
+                    random_state=RANDOM_STATE,
+                ),
+            ),
+        ]
+    )
+
+
+def evaluate_model(
+    y_true: np.ndarray,
+    y_proba: np.ndarray,
+    threshold: float = 0.50,
+) -> EvaluationResult:
+    y_pred = (y_proba >= threshold).astype(int)
+
+    auc = roc_auc_score(y_true, y_proba)
+    gini = gini_from_auc(auc)
+    ks = ks_statistic(y_true, y_proba)
+    acc = accuracy_score(y_true, y_pred)
+    cm = confusion_matrix(y_true, y_pred)
+    report = classification_report(y_true, y_pred, digits=4)
+
+    return EvaluationResult(
+        threshold=threshold,
+        accuracy=float(acc),
+        roc_auc=float(auc),
+        gini=float(gini),
+        ks=float(ks),
+        confusion_matrix=cm,
+        classification_report=report,
+    )
+
+
+# --------------------------------------------------
+# 4. Feature importance helper
+# --------------------------------------------------
+def extract_feature_importance(
+    pipeline: Pipeline,
+    feature_names: list[str],
+) -> pd.DataFrame:
+    """
+    Logistic regression coefficient magnitude as a simple feature
+    importance proxy.
+    """
+    model = pipeline.named_steps["model"]
+    coefs = model.coef_[0]
+
+    importance_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "coefficient": coefs,
+            "abs_coefficient": np.abs(coefs),
+        }
+    ).sort_values("abs_coefficient", ascending=False)
+
+    return importance_df
+
+
+# --------------------------------------------------
+# 5. Main
+# --------------------------------------------------
+def main() -> None:
+    print("Loading synthetic credit-risk dataset...")
+    X, y = load_credit_risk_data()
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=0.20,
+        stratify=y,
+        random_state=RANDOM_STATE,
+    )
+
+    print(f"Train shape: {X_train.shape}")
+    print(f"Test shape:  {X_test.shape}")
+    print(f"Default rate (train): {y_train.mean():.4f}")
+    print(f"Default rate (test):  {y_test.mean():.4f}\n")
+
+    model = build_model()
+    model.fit(X_train, y_train)
+
+    # Probability of default
+    y_test_proba = model.predict_proba(X_test)[:, 1]
+
+    # Evaluate at default threshold
+    default_threshold = 0.50
+    results = evaluate_model(
+        y_true=y_test.to_numpy(),
+        y_proba=y_test_proba,
+        threshold=default_threshold,
+    )
+
+    print("=== Model Performance ===")
+    print(f"Threshold: {results.threshold:.2f}")
+    print(f"Accuracy : {results.accuracy:.4f}")
+    print(f"ROC-AUC  : {results.roc_auc:.4f}")
+    print(f"Gini     : {results.gini:.4f}")
+    print(f"KS       : {results.ks:.4f}\n")
+
+    print("=== Confusion Matrix ===")
+    print(results.confusion_matrix)
+    print()
+
+    print("=== Classification Report ===")
+    print(results.classification_report)
+
+    # Show threshold sensitivity
+    print("=== Threshold Comparison ===")
+    for threshold in [0.30, 0.40, 0.50, 0.60]:
+        threshold_result = evaluate_model(
+            y_true=y_test.to_numpy(),
+            y_proba=y_test_proba,
+            threshold=threshold,
+        )
+        print(
+            f"Threshold={threshold:.2f} | "
+            f"Accuracy={threshold_result.accuracy:.4f} | "
+            f"AUC={threshold_result.roc_auc:.4f} | "
+            f"Gini={threshold_result.gini:.4f} | "
+            f"KS={threshold_result.ks:.4f}"
+        )
+
+    # Feature importance
+    importance_df = extract_feature_importance(
+        pipeline=model,
+        feature_names=X.columns.tolist(),
+    )
+
+    print("\n=== Top Feature Signals (by abs coefficient) ===")
+    print(importance_df.head(10).to_string(index=False))
+
+    # Example probability-of-default outputs
+    sample_output = pd.DataFrame(
+        {
+            "actual_default": y_test.iloc[:10].to_numpy(),
+            "predicted_pd": np.round(y_test_proba[:10], 4),
+            "decision_at_0.50": (y_test_proba[:10] >= 0.50).astype(int),
+        }
+    )
+
+    print("\n=== Sample Scored Accounts ===")
+    print(sample_output.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
